@@ -186,7 +186,89 @@ PASS
 
 ## 7. 강의 외 추가 구현
 
-TODO
+### Redis Lua 스크립트 방식 실험
+
+비관적 락의 처리량 한계를 개선하기 위해 **Redis 원자 연산**으로 재구현하고 비교 측정
+
+#### 구현
+
+**CouponIssuer.kt**:14-29
+```kotlin
+private val script: RedisScript<Long> = RedisScript.of(
+    ClassPathResource("lua/issue.lua"), Long::class.java
+)
+
+fun tryIssue(couponId: Long) {
+    val result = redisTemplate.execute(script, listOf(stockKey(couponId)))
+    when (result) {
+        1L -> Unit                      // 발급 성공
+        0L -> throw SoldOutException()  // 품절
+    }
+}
+```
+
+**issue.lua**:1-7
+```lua
+local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
+if remaining <= 0 then
+    return 0  -- 품절
+end
+redis.call('DECR', KEYS[1])
+return 1  -- 성공
+```
+
+**CouponService.kt**:56-57
+```kotlin
+couponIssuer.tryIssue(couponId)  // Redis로 재고 검증 + 감소 (원자적)
+couponRepository.incrementIssuedQuantity(couponId)  // DB 카운터 업데이트
+```
+
+#### 결과 비교
+
+| 지표 | 비관적 락 | Redis Lua | 개선율 |
+|---|---|---|---|
+| **처리량** | 162 req/s | 195 req/s | +20% |
+| **P95 응답시간** | 48.93s | 45.12s | -8% |
+| **드롭율** | 94.1% | 93.5% | -0.6%p |
+| **초과발급** | ✅ OK | ✅ OK | - |
+| **카운터 일치** | ✅ OK | ✅ OK | - |
+
+#### k6 상세 출력 (Redis Lua)
+
+```
+HTTP
+http_req_duration..............: avg=22.8s  min=0s       med=24.95s max=46.65s p(90)=42.85s p(95)=45.12s
+  { expected_response:true }...: avg=24.18s min=748.67ms med=24.46s max=46.57s p(90)=42.17s p(95)=44.41s
+http_req_failed................: 48.45% 4701 out of 9701
+http_reqs......................: 9701   194.891393/s
+
+EXECUTION
+dropped_iterations.............: 141298 2818.562271/s
+iterations.....................: 9701   194.891393/s
+```
+
+```sql
++-----------------+----------------+---------------+---------------+-------------+
+| issued_quantity | total_quantity | issuance_rows | over_issuance | count_match |
++-----------------+----------------+---------------+---------------+-------------+
+|            5000 |           5000 |          5000 | OK            | OK          |
++-----------------+----------------+---------------+---------------+-------------+
+PASS
+```
+
+#### 분석
+
+**✅ 개선 효과**
+- SELECT ... FOR UPDATE 락 대기 제거 → 처리량 +20%
+- Redis 인메모리 연산으로 재고 검증 고속화
+
+**⚠️ 여전히 낮은 이유**
+- **DB INSERT 병목**: `issuanceRepository.save()` 여전히 동기 처리
+- **중복 체크 DB 조회**: `existsByUserIdAndCouponId()` 매번 SELECT
+- **트랜잭션 오버헤드**: 5,000건 모두 개별 트랜잭션 커밋
+
+**결론**: Redis로 재고 관리를 옮겨도 **DB 쓰기 병목**이 남아 있음
+→ 3단계(비동기 큐)에서 DB 쓰기를 분리해야 근본 해결 가능
 
 ## 8. 트러블슈팅
 
