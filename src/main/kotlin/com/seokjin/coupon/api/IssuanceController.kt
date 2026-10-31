@@ -15,10 +15,10 @@ class IssuanceController(
 ) {
     @PostMapping("/{issuanceId}/use")
     fun use(
-        @PathVariable issueId: Long,
+        @PathVariable issuanceId: Long,
         @RequestHeader("X-User-Id") userId: Long,
     ): IssuanceResponse{
-        val issuance = issuanceService.use(issueId,userId)
+        val issuance = issuanceService.use(issuanceId,userId)
         return IssuanceResponse.from(issuance)
     }
 }
