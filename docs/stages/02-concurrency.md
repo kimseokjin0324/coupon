@@ -272,4 +272,119 @@ PASS
 
 ## 8. 트러블슈팅
 
-TODO
+### HikariCP 커넥션 풀 부족 문제
+
+#### 증상
+
+최초 부하 테스트에서 강의 결과(P99 3.96s) 대비 **10배 이상 느린 응답시간**(P99 43.03s) 발생
+
+```
+HTTP
+http_req_duration..............: avg=22.06s p(95)=42.32s p(99)=43.03s
+http_reqs......................: 195.52 req/s
+```
+
+#### 원인 분석
+
+**CouponService.kt:38-68** 동기 처리 경로에서 HikariCP 커넥션 풀 대기
+
+```kotlin
+@Transactional
+fun issue(couponId: Long, userId: Long): Issuance {
+    // 1. Redis 재고 차감 (5ms)
+    couponIssuer.tryIssue(couponId)
+
+    // 2. DB UPDATE (50ms) ← 커넥션 필요
+    couponRepository.incrementIssuedQuantity(couponId)
+
+    // 3. DB INSERT (100ms) ← 커넥션 필요
+    return issuanceRepository.save(...)
+}
+```
+
+Docker 로그 확인 결과:
+
+```
+Maximum pool size: undefined/unknown
+```
+
+**HikariCP 기본값 10개** vs **Tomcat 스레드 150개**
+- 5,000 req/s → 2,834개 요청이 실제 처리됨
+- 이 중 **140개 이상이 커넥션 대기** → 평균 22초 대기
+
+#### 해결 시도
+
+**application.yaml:8-11**
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 50      # 10 → 50
+      minimum-idle: 10
+      connection-timeout: 3000
+  threads:
+    virtual:
+      enabled: true              # Virtual Thread 활성화
+```
+
+#### 결과 비교 (pool=10 vs pool=50)
+
+| 지표 | pool=10 | pool=50 | 개선율 |
+|---|---|---|---|
+| **처리량** | 195 req/s | 2,834 req/s | **+1353%** |
+| **P99 응답시간** | 43.03s | 4.3s | **-90%** |
+| **P95 응답시간** | 42.32s | 3.6s | **-91%** |
+| **드롭율** | 93.4% (140,055/150,003) | 36.4% (54,668/150,003) | **-57%p** |
+| **성공률** | 98.2% (4,997 성공) | **2.6%** (2,483 성공) | **-95%p** ❌ |
+| **에러율** | 1.8% | **97.2%** (92,691건 5xx) | **+95%p** ❌ |
+| **정합성** | ✅ OK (4,997 = 4,997) | ✅ OK (2,483 = 2,483) | - |
+
+#### k6 상세 출력 (pool=50)
+
+```
+HTTP
+http_req_duration..............: avg=1.08s min=0s      med=0s     max=7s    p(90)=3.32s p(95)=3.6s
+  { expected_response:true }...: avg=3.6s  min=29.77ms med=3.62s  max=7s    p(90)=4.88s p(95)=6.11s
+http_req_failed................: 97.39% 92852 out of 95335
+http_reqs......................: 95335  2834.06 req/s
+
+CUSTOM
+status_2xx.....................: 2483   73.81/s
+status_409_sold_out_or_dup.....: 161    4.79/s
+status_other (5xx/에러)........: 92691  2755.46/s  ← 97.2%가 에러!
+```
+
+#### 에러 로그
+
+```
+java.sql.SQLTransientConnectionException:
+HikariPool-1 - Connection is not available, request timed out after 3000ms
+(total=50, active=50, idle=0, waiting=1)
+```
+
+**분석**: 2,834 req/s 부하에서 50개 커넥션으로도 부족 → 대기 시간 3초 초과 → 타임아웃 에러
+
+#### 트레이드오프 정리
+
+| 설정 | 장점 | 단점 |
+|---|---|---|
+| **pool=10** | 안정적 (에러율 1.8%), 정합성 보장 | 처리량 매우 낮음 (195 req/s) |
+| **pool=50** | 처리량 14배 증가 (2,834 req/s) | 에러율 97%, 재고 절반만 처리 |
+| pool=100+ | 에러율 감소 가능 | MySQL 부하 급증, 단일 DB 한계 |
+
+#### 근본 원인
+
+**동기 처리 아키텍처의 한계**:
+- 사용자가 DB INSERT 완료까지 대기 (평균 150ms+)
+- 5,000 req/s × 150ms = **최소 750개 동시 커넥션 필요**
+- 커넥션 풀을 늘려도 MySQL 단일 인스턴스가 병목
+
+#### 결론
+
+커넥션 풀 튜닝만으로는 **처리량과 안정성을 동시에** 달성 불가
+
+**→ 3단계: 비동기 큐(Kafka)로 근본 해결 필요**
+- API는 큐 적재만 하고 즉시 응답 (< 100ms)
+- 백그라운드 Worker가 DB 처리
+- 커넥션 풀 크기와 무관하게 처리량 확보
