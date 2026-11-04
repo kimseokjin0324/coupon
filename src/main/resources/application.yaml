@@ -23,6 +23,8 @@ spring:
   mvc:
     problemdetails:
       enabled: true
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
   threads:
     virtual:
       enabled: true  # Virtual Thread 활성화 (Spring Boot 3.2+)

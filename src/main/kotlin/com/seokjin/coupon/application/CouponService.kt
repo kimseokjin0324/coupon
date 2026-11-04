@@ -4,10 +4,10 @@ import com.seokjin.coupon.api.dto.CreateCouponRequest
 import com.seokjin.coupon.domain.Coupon
 import com.seokjin.coupon.domain.CouponRepository
 import com.seokjin.coupon.domain.Issuance
+import com.seokjin.coupon.infrastructure.messaging.IssuanceRequestProducer
 import com.seokjin.coupon.infrastructure.messaging.IssuanceRequested
 import com.seokjin.coupon.support.CouponNotFoundException
 import com.seokjin.coupon.support.NotStartedException
-import org.springframework.context.ApplicationEventPublisher
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
@@ -16,7 +16,7 @@ import java.time.LocalDateTime
 class CouponService(
     private val couponRepository: CouponRepository,
     private val couponIssuer: CouponIssuer,
-    private val eventPublisher: ApplicationEventPublisher,
+    private val issuanceRequestProducer: IssuanceRequestProducer,
 ) {
     @Transactional
     fun createCoupon(request: CreateCouponRequest): Coupon {
@@ -47,7 +47,7 @@ class CouponService(
 
 
         val expiredAt = now.plusDays(coupon.validityDays.toLong())
-        eventPublisher.publishEvent(
+        issuanceRequestProducer.publish(
             IssuanceRequested(
                 couponId = couponId,
                 userId = userId,
