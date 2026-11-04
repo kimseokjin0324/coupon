@@ -4,6 +4,7 @@ import com.seokjin.coupon.api.dto.CreateCouponRequest
 import com.seokjin.coupon.domain.Coupon
 import com.seokjin.coupon.domain.CouponRepository
 import com.seokjin.coupon.domain.Issuance
+import com.seokjin.coupon.infrastructure.cache.CacheProperties
 import com.seokjin.coupon.infrastructure.messaging.IssuanceRequestProducer
 import com.seokjin.coupon.infrastructure.messaging.IssuanceRequested
 import com.seokjin.coupon.support.CouponNotFoundException
@@ -15,6 +16,8 @@ import java.time.LocalDateTime
 @Service
 class CouponService(
     private val couponRepository: CouponRepository,
+    private val cacheProperties: CacheProperties,
+    private val cacheMetrics: CacheMetrics,
     private val couponIssuer: CouponIssuer,
     private val issuanceRequestProducer: IssuanceRequestProducer,
 ) {
@@ -35,6 +38,10 @@ class CouponService(
 
     @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
+
+        cacheMetrics.incrementCouponDbRead()
+        Thread.sleep(cacheProperties.simulatedLoadLatencyMs)    //로컬 DB라서 읽는 시간이 빨라 일부러 100ms 정도 늦춰서 테스트
+
         val coupon = couponRepository.findById(couponId).orElseThrow { CouponNotFoundException() }
 
         val now = LocalDateTime.now()
