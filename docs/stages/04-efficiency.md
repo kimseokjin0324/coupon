@@ -1,0 +1,138 @@
+# 4단계: 효율성 (캐시, 매진 플래그)
+
+## 1. 문제
+
+3단계에서 Kafka 비동기 발급으로 응답성을 개선했지만, 발급 API는 여전히 **모든 요청마다 쿠폰 정보를 DB에서 조회**한다.
+
+### 1-1. DB 조회 병목 재현 (Baseline 측정)
+
+동일한 쿠폰(ID=1)에 대한 발급 요청 급증 시나리오:
+- **부하**: 500 req/s × 30초 = 15,000 요청
+- **상황**: 쿠폰 NotStarted 상태 → 재고 차감 없이 정책 조회만 수행
+
+| 지표 | 워밍업 (1차) | 본 측정 (2차) | 비고 |
+|---|---|---|---|
+| **P99 응답시간** | 25.8ms | 3.15ms | InnoDB 버퍼풀 워밍업 효과 |
+| **P95 응답시간** | 3.45ms | 2.26ms | |
+| **평균 응답시간** | 3.13ms | 1.74ms | |
+| **couponDbReads** | 15,000 | 15,000 | **모든 요청이 DB 조회** |
+| **couponCacheHits** | 0 | 0 | 캐시 미적용 |
+| **soldOutRedisExists** | 0 | 0 | 매진 플래그 미적용 |
+| **soldOutFastPathHits** | 0 | 0 | |
+
+**문제점**:
+- 15,000번의 동일 쿠폰 조회가 모두 DB로 전달됨
+- 워밍업 후에도 P99 3.15ms → 트래픽 증가 시 DB가 병목 가능
+- DB CPU/커넥션 자원 낭비
+
+## 2. 원인
+
+- 쿠폰 정책은 **변경 빈도가 낮지만 조회 빈도는 매우 높은** read-heavy 워크로드
+- 매번 DB 왕복으로 불필요한 네트워크 비용 + 커넥션 자원 소모
+- 동일 데이터를 15,000번 반복 조회 → 캐시로 해결 가능한 전형적인 케이스
+
+## 3. 선택한 방법
+
+### 단계적 개선 전략
+
+Cache Stampede 문제를 **점진적으로 해결**하면서 각 단계의 효과를 측정:
+
+| 단계 | 구현 | 해결하는 문제 | 측정 스크립트 |
+|---|---|---|---|
+| **4-0** | 캐시 미적용 (Baseline) | - | `coupon_burst.js` |
+| **4-1a** | Redis Cache 기본 적용 | DB 반복 조회 | `coupon_burst.js` |
+| **4-1b** | Single Flight 적용 | Cache Stampede (TTL 만료 시 동시 DB 조회) | `coupon_burst.js` |
+| **4-1c** | SWR 적용 | TTL 만료 순간의 응답 지연 | `coupon_burst.js` |
+
+**Cache Stampede란?**
+TTL 만료 직후 동시에 같은 키를 요청할 때, 캐시 미스가 발생해 **모든 요청이 DB로 몰리는 현상**.
+`COUPON_CACHE_TTL_MS=1000` (1초)로 강제 설정해 재현.
+
+**Single Flight (중복 제거)**
+동일 키에 대한 동시 요청을 **하나로 묶어서 DB 조회는 1번만** 수행.
+
+**SWR (Stale-While-Revalidate)**
+TTL 만료 시 **만료된 캐시를 즉시 반환**하고, **백그라운드에서 비동기 갱신**.
+→ 응답 지연 없이 일관된 P99 유지.
+
+## 4. 고려한 대안
+
+### 4-1. 캐시 저장소 선택
+
+| 대안 | 장점 | 선택한/하지 않은 이유 |
+|---|---|---|
+| **Redis** (선택) | 분산 환경 공유, 만료 정책 내장, Lua 스크립트 지원 | ✅ 선택: 이미 재고 관리에 사용 중, 추가 인프라 불필요 |
+| Local Cache (Caffeine) | 네트워크 비용 없음, 매우 빠름 | Pod별 캐시 불일치 가능, TTL 만료 시점 분산 어려움 |
+| Spring Cache (추상화) | 구현체 교체 용이 | Redis 직접 사용이 Single Flight / SWR 구현에 더 유리 |
+
+### 4-2. Cache Stampede 해결 방법
+
+| 대안 | 장점 | 선택한/하지 않은 이유 |
+|---|---|---|
+| **Single Flight** (선택) | 동시 요청을 하나로 묶어 DB 조회 최소화 | ✅ 선택: 측정 단계(4-1b)로 포함 |
+| **SWR** (선택) | 만료된 값 즉시 반환 → P99 안정화 | ✅ 선택: 최종 목표(4-1c) |
+| Probabilistic Early Expiration | 통계적 분산으로 stampede 완화 | 완전한 해결은 아님, SWR이 더 결정적 |
+| Lock-based | 첫 요청만 갱신, 나머지 대기 | Single Flight와 유사하나 구현 복잡도 높음 |
+| 무한 TTL + 이벤트 갱신 | stampede 원천 제거 | 쿠폰 수정 이벤트 구독 필요, 복잡도 높음 |
+
+## 5. 결과 (Before / After)
+
+### 5-1. Cache Stampede 해결 단계별 비교 (coupon_burst.js)
+
+**측정 조건**: 500 req/s × 30초 = 15,000 요청, `COUPON_CACHE_TTL_MS=1000` (1초 TTL)
+
+| 지표 | 4-0 (캐시 미적용) | 4-1a (Redis Cache) | 4-1b (Single Flight) | 4-1c (SWR) |
+|---|---|---|---|---|
+| **P99 (ms)** | 3.15 | TODO | TODO | TODO |
+| **P95 (ms)** | 2.26 | TODO | TODO | TODO |
+| **평균 (ms)** | 1.74 | TODO | TODO | TODO |
+| **couponDbReads** | 15,000 | TODO | TODO | TODO |
+| **couponCacheHits** | 0 | TODO | TODO | TODO |
+| **Threshold 통과** | ✅ | TODO | TODO | TODO |
+
+**예상 패턴**:
+- **4-1a**: 캐시 도입 → DB 조회 감소하지만, TTL 만료마다 stampede 발생 → P99 튐
+- **4-1b**: Single Flight → stampede 윈도우에서 DB 조회 1번으로 감소, 하지만 대기 시간 발생 → P99 여전히 튐
+- **4-1c**: SWR → 만료된 캐시 즉시 반환 → P99 안정화 ✅
+
+### 5-2. 기존 발급 시나리오 영향 검증
+
+TODO(기존 부하테스트 재실행 필요)
+
+| 지표 | 3단계 (Kafka) | 4단계 (캐시 추가) | 비고 |
+|---|---|---|---|
+| TPS | TODO | TODO | |
+| P95 (ms) | TODO | TODO | |
+| 정합성 검증 | TODO | TODO | |
+
+## 6. 트레이드오프 / 남은 한계
+
+### 6-1. 트레이드오프
+
+| 항목 | 득(Gain) | 실(Loss) |
+|---|---|---|
+| **Redis 캐시 도입** | DB 부하 대폭 감소, 응답 속도 향상 | 캐시-DB 정합성 관리 필요, 메모리 비용 |
+| **SWR 패턴** | P99 안정화, UX 일관성 | 최대 TTL 동안 stale 데이터 제공 (쿠폰 정책은 변경 빈도 낮아 허용 가능) |
+| **짧은 TTL (1초)** | 테스트 목적으로 stampede 재현 용이 | 운영 환경에서는 더 긴 TTL 필요 (예: 60초) |
+
+### 6-2. 남은 한계
+
+TODO(측정 후 작성)
+
+**예상되는 다음 문제**:
+- 쿠폰 매진 후에도 발급 API 호출이 계속 들어오는 경우, Redis 원자 연산 + Kafka 발행 오버헤드 발생
+- → **5단계 (정합성)**: 매진 플래그, 보상 트랜잭션, 대사 배치 등으로 해결
+
+## 7. 강의 외 추가 구현
+
+TODO(구현 내용에 따라 작성)
+
+**가능한 차별화 포인트**:
+- Single Flight 구현 방식 (Kotlin Coroutine, CompletableFuture 등)
+- SWR 비동기 갱신 방식 (별도 스레드풀, Kotlin suspend fun 등)
+- 캐시 메트릭 모니터링 (`CacheMetricController` 활용)
+- TTL 동적 조정 전략
+
+## 8. 트러블슈팅
+
+TODO
