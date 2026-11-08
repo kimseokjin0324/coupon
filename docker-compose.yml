@@ -2,16 +2,16 @@ services:
   mysql:
     image: mysql:8.4
     environment:
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: coupon
       MYSQL_USER: coupon
-      MYSQL_PASSWORD: coupon
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -67,7 +67,7 @@ services:
     environment:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/coupon
       SPRING_DATASOURCE_USERNAME: coupon
-      SPRING_DATASOURCE_PASSWORD: coupon
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -76,6 +76,9 @@ services:
       # issue 쿠폰 정보 조회의 stampede 차이를 보이기 위한 DB latency 시뮬레이션.
       COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS: ${COUPON_CACHE_SIMULATED_LOAD_LATENCY_MS:-100}
       COUPON_CACHE_FRESH_MS: ${COUPON_CACHE_FRESH_MS:-500}
+      # 매진 플래그
+      COUPON_SOLD_OUT_TTL_SECONDS: ${COUPON_SOLD_OUT_TTL_SECONDS:-86400}
+      COUPON_SOLD_OUT_FAST_PATH_TTL_MS: ${COUPON_SOLD_OUT_FAST_PATH_TTL_MS:-1000}
     ports:
       - "8080:8080"
 
