@@ -11,7 +11,6 @@ for uid in $(seq 1 100); do
   curl -fsS -X POST "http://localhost:8080/api/coupons/${COUPON_ID}/issue" \
     -H "X-User-Id: ${uid}" >/dev/null || true
 done
-
 # Worker drain 대기 (간단히 sleep). 더 정확히 보려면 verify_burst.sh 의 폴링 활용.
 sleep 3
 

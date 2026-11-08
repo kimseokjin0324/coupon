@@ -9,6 +9,7 @@ import com.seokjin.coupon.infrastructure.messaging.IssuanceRequestProducer
 import com.seokjin.coupon.infrastructure.messaging.IssuanceRequested
 import com.seokjin.coupon.support.CouponNotFoundException
 import com.seokjin.coupon.support.NotStartedException
+import com.seokjin.coupon.support.SoldOutException
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
@@ -19,6 +20,7 @@ class CouponService(
     private val couponIssuePolicyReader: CouponIssuePolicyReader,
     private val couponIssuer: CouponIssuer,
     private val issuanceRequestProducer: IssuanceRequestProducer,
+    private val soldOutState: SoldOutState,
 ) {
     @Transactional
     fun createCoupon(request: CreateCouponRequest): Coupon {
@@ -37,6 +39,10 @@ class CouponService(
 
     @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
+
+        if (soldOutState.isSoldOut(couponId)) {
+            throw SoldOutException()
+        }
 
         val policy = couponIssuePolicyReader.get(couponId)
 

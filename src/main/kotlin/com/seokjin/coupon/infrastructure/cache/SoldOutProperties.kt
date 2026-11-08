@@ -1,4 +1,10 @@
 package com.seokjin.coupon.infrastructure.cache
 
-class SoldOutProperties {
+import org.springframework.boot.context.properties.ConfigurationProperties
+
+@ConfigurationProperties(prefix = "coupon-sold-out")
+class SoldOutProperties(
+    val ttlSeconds: Long,
+    val fastPathTtlMs: Long,
+) {
 }
