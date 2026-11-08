@@ -61,6 +61,18 @@ TTL 만료 직후 동시에 같은 키를 요청할 때, 캐시 미스가 발생
 TTL 만료 시 **만료된 캐시를 즉시 반환**하고, **백그라운드에서 비동기 갱신**.
 → 응답 지연 없이 일관된 P99 유지.
 
+**구현 방식** (Redis Hash + Background Thread Pool):
+- **Redis Hash 구조**: `{value: JSON, fetchedAtMs: 타임스탬프}` 저장
+- **freshMs 기준**: `now - fetchedAtMs < freshMs` → fresh, 아니면 stale
+- **Lua 스크립트**: 캐시 조회 + 신선도 판단 + 락 획득을 원자적으로 처리
+  - `HIT`: 신선한 캐시 → 즉시 반환
+  - `STALE_REFRESH`: 만료된 캐시 → **stale 값 즉시 반환** + 백그라운드 갱신 트리거
+  - `LOAD`: 캐시 없음 → DB 조회 (첫 요청)
+  - `WAIT`: 다른 요청이 LOAD 중 → 대기
+- **백그라운드 스레드풀**: `Executors.newFixedThreadPool(4)` (daemon 스레드)
+  - STALE_REFRESH 시 비동기로 `fillCache()` 실행
+  - 사용자 응답에 영향 없음 (fire-and-forget)
+
 ## 4. 고려한 대안
 
 ### 4-1. 캐시 저장소 선택
@@ -89,13 +101,13 @@ TTL 만료 시 **만료된 캐시를 즉시 반환**하고, **백그라운드에
 
 | 지표 | 4-0 (캐시 미적용) | 4-1a (Redis Cache) | 4-1b (Single Flight) | 4-1c (SWR) |
 |---|---|---|---|---|
-| **P99 (ms)** | 3.15 | 103.46 ⚠️ | 104.13 ⚠️ | TODO |
-| **P95 (ms)** | 2.26 | 102.85 ⚠️ | 63.24 ✅ | TODO |
-| **평균 (ms)** | 1.74 | 10.18 | 7.76 ✅ | TODO |
-| **couponDbReads** | 15,000 | 1,250 ✅ | 28 ✅✅ | TODO |
-| **couponCacheHits** | 0 | 13,751 ✅ | 14,972 ✅✅ | TODO |
-| **캐시 히트율** | 0% | 91.7% | 99.81% ✅✅ | TODO |
-| **Threshold 통과** | ✅ | ✅ (threshold은 p(99)<200) | ✅ | TODO |
+| **P99 (ms)** | 3.15 | 103.46 ⚠️ | 104.13 ⚠️ | **3.09** ✅✅ |
+| **P95 (ms)** | 2.26 | 102.85 ⚠️ | 63.24 ✅ | **2.12** ✅✅ |
+| **평균 (ms)** | 1.74 | 10.18 | 7.76 ✅ | **1.91** ✅✅ |
+| **couponDbReads** | 15,000 | 1,250 ✅ | 28 ✅✅ | 50 ✅ |
+| **couponCacheHits** | 0 | 13,751 ✅ | 14,972 ✅✅ | 15,000 ✅✅ |
+| **캐시 히트율** | 0% | 91.7% | 99.81% ✅✅ | **100%** ✅✅ |
+| **Threshold 통과** | ✅ | ✅ (threshold은 p(99)<200) | ✅ | ✅ |
 
 **4-1a 상세 측정값**:
 
@@ -172,6 +184,65 @@ TTL 만료 시 **만료된 캐시를 즉시 반환**하고, **백그라운드에
 
 → **다음 단계 (4-1c)**: SWR(Stale-While-Revalidate)로 만료된 캐시를 즉시 반환하고 백그라운드 갱신
 
+**4-1c 상세 측정값**:
+
+| 회차 | P99 | P95 | 평균 | couponDbReads | couponCacheHits |
+|---|---|---|---|---|---|
+| 워밍업 (1차) | 2.64ms | 2.1ms | 1.9ms | 50 | 15,000 |
+| 본 측정 (2차) | 3.09ms | 2.12ms | 1.91ms | 50 | 15,000 |
+
+**4-1c 결과 분석 (SWR - Stale-While-Revalidate)**:
+
+🎉 **목표 달성! P99를 캐시 없을 때 수준으로 복원**:
+- P99 **97.0% 개선** (104.13ms → 3.09ms)
+- P95 **96.6% 개선** (63.24ms → 2.12ms)
+- 평균 **75.4% 개선** (7.76ms → 1.91ms)
+- **캐시 없을 때(4-0)와 거의 동일한 응답성** (P99 3.15ms vs 3.09ms)
+
+✅ **DB 조회 극소화 유지**:
+- couponDbReads: 50회 (TTL 30번 만료 × ~1.67회/만료)
+- 캐시 히트율: **100%** (15,000/15,000)
+- 모든 요청이 캐시에서 응답 (stale 포함)
+
+✅ **Cache Stampede 완전 해소 + 응답 지연 제거**:
+- TTL 만료 시 **stale 값을 즉시 반환** → 대기 시간 0
+- 백그라운드에서 **비동기 갱신** → 사용자 응답에 영향 없음
+- P99 안정화 (104.13ms → 3.09ms, **33배 개선**)
+
+**SWR의 동작 방식**:
+```
+┌─ TTL 만료 순간 (SWR 적용) ──────────────┐
+│ 500 req/s → 캐시 TTL 만료               │
+│ ├─ 요청1 → stale 캐시 즉시 반환 ⚡      │
+│ │           + 백그라운드 갱신 시작 🔄   │
+│ ├─ 요청2 → stale 캐시 즉시 반환 ⚡      │
+│ ├─ 요청3 → stale 캐시 즉시 반환 ⚡      │
+│ └─ ... 모든 요청이 즉시 응답            │
+│    → 응답시간: ~2ms (캐시 조회만)       │
+│    → DB 조회는 백그라운드에서 진행      │
+│    → 갱신 완료 후 다음 요청부터 fresh   │
+└─────────────────────────────────────────┘
+```
+
+**4-1b (Single Flight)와 차이**:
+```
+Single Flight:
+  TTL 만료 → 첫 요청이 DB 대기 (101ms)
+           → 나머지 요청도 대기 (20ms × N회)
+           → P99 = 104ms
+
+SWR:
+  TTL 만료 → 모든 요청이 stale 즉시 반환 (2ms)
+           → DB 갱신은 백그라운드 (사용자 무관)
+           → P99 = 3ms ✅
+```
+
+**트레이드오프**:
+- **Gain**: P99 33배 개선, 응답 지연 제거, UX 일관성
+- **Loss**: TTL 만료 후 갱신 전까지 **최대 TTL(1초) 동안 stale 데이터** 제공
+  - 하지만 쿠폰 정책은 변경 빈도 매우 낮음 (생성 후 거의 수정 안 함)
+  - 1초 stale은 비즈니스적으로 허용 가능
+
 ### 5-2. 기존 발급 시나리오 영향 검증
 
 TODO(기존 부하테스트 재실행 필요)
@@ -202,13 +273,90 @@ TODO(측정 후 작성)
 
 ## 7. 강의 외 추가 구현
 
-TODO(구현 내용에 따라 작성)
+### 7-1. 단계별 측정으로 문제와 해법 증명
 
-**가능한 차별화 포인트**:
-- Single Flight 구현 방식 (Kotlin Coroutine, CompletableFuture 등)
-- SWR 비동기 갱신 방식 (별도 스레드풀, Kotlin suspend fun 등)
-- 캐시 메트릭 모니터링 (`CacheMetricController` 활용)
-- TTL 동적 조정 전략
+**차별화 포인트**: Cache Stampede를 **3단계로 나눠 측정**하며 각 해법의 효과와 한계를 수치로 입증
+
+| 단계 | 측정 목적 | 발견한 문제 | 해결 방법 |
+|---|---|---|---|
+| **4-1a (Redis Cache)** | 캐시 도입 효과 측정 | DB 조회 91.7% 감소, **하지만 P99 33배 악화** (stampede) | → 4-1b로 진행 |
+| **4-1b (Single Flight)** | Stampede 해소 검증 | DB 조회 97.8% 감소, **하지만 P99 여전히 높음** (대기) | → 4-1c로 진행 |
+| **4-1c (SWR)** | 응답성 복원 검증 | P99 97% 개선, 캐시 없을 때 수준으로 복원 | ✅ 완료 |
+
+**강의와 차이**:
+- 강의: SWR만 적용하고 최종 결과 측정
+- 이 프로젝트: **왜 SWR이 필요한지를 숫자로 증명** (4-1a → 4-1b → 4-1c)
+
+### 7-2. Redis Hash + 타임스탬프로 SWR 구현
+
+**기술적 구현** (`CouponCacheRepository.kt`, `cache-single-flight-swr.lua`):
+
+```kotlin
+// Redis Hash 구조
+HSET coupon:1:issue-policy
+  value       = "{\"id\":1,...}"
+  fetchedAtMs = "1704067200000"
+
+// Lua에서 신선도 판단
+if now - fetchedAtMs < freshMs then
+  return {"HIT", value}  // fresh
+else
+  return {"STALE_REFRESH", value}  // stale이지만 즉시 반환
+end
+```
+
+**대안과 비교**:
+| 구현 방식 | 장점 | 이 프로젝트가 선택하지 않은 이유 |
+|---|---|---|
+| TTL 두 개 (soft, hard) | 구현 간단 | Redis 키 2개 관리, Lua 스크립트로 원자성 보장 어려움 |
+| Caffeine (Local Cache) | 네트워크 비용 없음 | Pod별 불일치, 분산 환경 고려 |
+| **Hash + 타임스탬프** (선택) | 원자적 조회/갱신, 단일 키 관리 | ✅ 선택 |
+
+### 7-3. 백그라운드 갱신 스레드풀 관리
+
+**구현** (`CouponCacheRepository.kt:25-27, 110-113`):
+
+```kotlin
+private val backgroundExecutor = Executors.newFixedThreadPool(4) { r ->
+    Thread(r, "coupon-cache-swr-refresh").apply { isDaemon = true }
+}
+
+@PreDestroy
+fun shutDown() {
+    backgroundExecutor.shutdown()  // 우아한 종료
+}
+```
+
+**차별화 포인트**:
+- **고정 크기 스레드풀 (4)**: 백그라운드 갱신이 무한정 늘어나지 않도록 제한
+- **Daemon 스레드**: 애플리케이션 종료 시 강제 종료되지만 `@PreDestroy`로 우아한 종료 시도
+- **예외 처리**: 백그라운드 갱신 실패 시 로그만 남기고 계속 진행 (사용자 응답에 영향 없음)
+
+**대안**:
+- `@Async` + Spring ThreadPoolTaskExecutor: 설정 간단하지만 fine-grained 제어 어려움
+- Kotlin Coroutine: 비동기 코드 간결하지만 프로젝트 전체를 suspend fun으로 전환 필요
+
+### 7-4. 캐시 메트릭 실시간 모니터링
+
+**구현** (`CacheMetrics.kt`, `CacheMetricController.kt`):
+- `couponDbReads`, `couponCacheHits`, `soldOutRedisExists` 카운터
+- 테스트 시작 전 `/metrics/cache/reset`으로 초기화
+- 테스트 종료 후 `/metrics/cache`로 집계 → **측정 결과 자동화**
+
+**효과**:
+- k6 스크립트에서 자동으로 카운터 조회 → **매뉴얼 확인 불필요**
+- 캐시 히트율 = `couponCacheHits / (couponCacheHits + couponDbReads)` 실시간 계산
+
+### 7-5. 짧은 TTL(1초)로 Stampede 재현
+
+**설정** (`application.yml`, `COUPON_CACHE_TTL_MS=1000`):
+- 운영 환경: TTL 60초 (stampede 거의 없음)
+- 테스트 환경: TTL 1초 (30초 동안 30번 만료 → stampede 명확히 재현)
+
+**측정 효과**:
+- 4-1a: 만료마다 평균 41.7개 요청이 stampede
+- 4-1b: 만료마다 평균 1회 DB 조회 (stampede 해소 증명)
+- 4-1c: 만료 시에도 P99 안정적 (stale 즉시 반환 증명)
 
 ## 8. 트러블슈팅
 
