@@ -16,8 +16,7 @@ import java.time.LocalDateTime
 @Service
 class CouponService(
     private val couponRepository: CouponRepository,
-    private val cacheProperties: CacheProperties,
-    private val cacheMetrics: CacheMetrics,
+    private val couponIssuePolicyReader: CouponIssuePolicyReader,
     private val couponIssuer: CouponIssuer,
     private val issuanceRequestProducer: IssuanceRequestProducer,
 ) {
@@ -39,21 +38,18 @@ class CouponService(
     @Transactional
     fun issue(couponId: Long, userId: Long): Issuance {
 
-        cacheMetrics.incrementCouponDbRead()
-        Thread.sleep(cacheProperties.simulatedLoadLatencyMs)    //로컬 DB라서 읽는 시간이 빨라 일부러 100ms 정도 늦춰서 테스트
-
-        val coupon = couponRepository.findById(couponId).orElseThrow { CouponNotFoundException() }
+        val policy = couponIssuePolicyReader.get(couponId)
 
         val now = LocalDateTime.now()
 
-        if (!coupon.isBookingOpen(now)) {
+        if (!policy.isBookingOpen(now)) {
             throw NotStartedException()
         }
 
         couponIssuer.tryIssue(couponId, userId)
 
 
-        val expiredAt = now.plusDays(coupon.validityDays.toLong())
+        val expiredAt = now.plusDays(policy.validityDays.toLong())
         issuanceRequestProducer.publish(
             IssuanceRequested(
                 couponId = couponId,
