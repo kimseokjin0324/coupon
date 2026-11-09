@@ -15,7 +15,8 @@
       "Bash(git push:*)",
       "Bash(docker images:*)",
       "Bash(bash:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(curl:*)"
     ]
   }
 }

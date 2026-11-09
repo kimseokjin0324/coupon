@@ -2,6 +2,7 @@ package com.seokjin.coupon.infrastructure.messaging
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerConfig
+import org.apache.kafka.common.serialization.ByteArrayDeserializer
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.serialization.StringSerializer
 import org.springframework.beans.factory.annotation.Value
@@ -67,6 +68,28 @@ class KafkaConfig(
         val factory = ConcurrentKafkaListenerContainerFactory<String, Any>()
         factory.setConsumerFactory(consumerFactory)
         factory.setCommonErrorHandler(errorHandler)
+        return factory
+    }
+
+    @Bean
+    fun dltConsumerFactory(): ConsumerFactory<String, ByteArray> {
+        val props = mapOf<String, Any>(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers,
+            ConsumerConfig.GROUP_ID_CONFIG to "issuance-dlt-log",
+            ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest",
+        )
+        return DefaultKafkaConsumerFactory(props, StringDeserializer(), ByteArrayDeserializer())
+    }
+
+    @Bean
+    fun dltKafkaListenerContainerFactory(
+        dltConsumerFactory: ConsumerFactory<String, ByteArray>,
+    ): ConcurrentKafkaListenerContainerFactory<String, ByteArray> {
+        val factory = ConcurrentKafkaListenerContainerFactory<String, ByteArray>()
+        factory.setConsumerFactory(dltConsumerFactory)
+        factory.setCommonErrorHandler(
+            DefaultErrorHandler(FixedBackOff(5_000L, FixedBackOff.UNLIMITED_ATTEMPTS)),
+        )
         return factory
     }
 }

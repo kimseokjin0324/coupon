@@ -7,22 +7,27 @@ import org.springframework.stereotype.Component
 import org.springframework.transaction.annotation.Transactional
 
 @Component
-class IssuanceTransactionalWriter (
+class IssuanceTransactionalWriter(
     private val issuanceRepository: IssuanceRepository,
     private val couponRepository: CouponRepository
-){
+) {
 
     @Transactional
     fun insertAndIncrement(event: IssuanceRequested) {
-         issuanceRepository.save(
-             Issuance(
-                 userId = event.userId,
-                 couponId = event.couponId,
-                 issuedAt = event.issuedAt,
-                 expiredAt = event.expiredAt,
-             )
+        if (issuanceRepository.existsByUserIdAndCouponId(event.userId, event.couponId)) return
+        issuanceRepository.save(
+            Issuance(
+                userId = event.userId,
+                couponId = event.couponId,
+                issuedAt = event.issuedAt,
+                expiredAt = event.expiredAt,
+            )
         )
         couponRepository.incrementIssuedQuantity(event.couponId)
 
     }
+
+    fun isAlreadyApplied(event: IssuanceRequested): Boolean =
+        issuanceRepository.existsByUserIdAndCouponId(event.userId, event.couponId)
+
 }

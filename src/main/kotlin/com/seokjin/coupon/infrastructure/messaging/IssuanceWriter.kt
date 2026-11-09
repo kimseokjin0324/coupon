@@ -14,9 +14,10 @@ class IssuanceWriter(
 ) {
 
     fun write(event: IssuanceRequested) {
-        try{
-        transactional.insertAndIncrement(event)
-        }catch (e: DataIntegrityViolationException){    //유니크제약조건 중복 인서트시 스프링에서 제공하는 exception
+        try {
+            transactional.insertAndIncrement(event)
+        } catch (e: DataIntegrityViolationException) {    //유니크제약조건 중복 인서트시 스프링에서 제공하는 exception
+            if (!transactional.isAlreadyApplied(event)) throw e
             log.debug { "UNIQUE 위반은 멱등 처리: couponId=${event.couponId}, userId=${event.userId}" }
         }
     }
