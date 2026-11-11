@@ -284,7 +284,124 @@ fun replay(ids: List<Long>): Int {
 
 ## 3-3. part-5-2: Reconcile Batch
 
-**TODO**: part-5-2 브랜치 구현 후 작성
+### 개념
+
+**대사(Reconcile)**:
+- Redis(발급 판정의 진실)와 DB(영속 기록)의 수치를 **주기적으로 맞춰 보는 배치**
+- 원인을 특정할 수 있는 불일치는 **자동 보정**, 특정할 수 없는 불일치는 **알람만**
+- DLT Replay(5-1)가 "DB에 못 들어간 메시지"를 다룬다면, 대사는 "Redis 쪽이 틀어진 상태"를 다룬다
+
+### 아키텍처
+
+```
+[발급 시 — 대사 대상 등록]
+issue.lua (원자 실행)
+    ├─ DECR stock
+    ├─ SADD coupon_{id}:users
+    └─ ZADD coupon:reconcile:recent <발급시각ms> <couponId>   ← 추가
+                                    (member=couponId, score=최신 발급 시각)
+
+[주기 대사 — 매 interval(기본 60초)]
+Reconciler.scheduleRecent()
+    ├─ cutoff = now - gracePeriod(기본 10초)
+    ├─ from   = cutoff - interval × 2
+    ├─ ZRANGEBYSCORE (from, cutoff] → 최근 발급된 couponId 목록
+    └─ couponId마다 CouponReconciler.reconcile()
+
+[수동 전체 대사]
+POST /admin/reconcile/run
+    └─ Reconciler.auditAll()  → 모든 쿠폰 대상
+         → { autoFixed, driftAlerts, redisDbDrift }
+```
+
+### 핵심 구현
+
+#### 1) 대사 대상 인덱스: 발급 Lua에 ZADD 추가
+
+**issue.lua**
+```lua
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], ARGV[1])
+-- 대사 sliding window 인덱스: 쿠폰별 최신 발급 시각을 score 로 (member 는 couponId, ZADD 가 갱신).
+redis.call('ZADD', KEYS[4], ARGV[3], ARGV[4])
+```
+
+- 발급과 **같은 Lua 안에서** 기록 → 발급은 됐는데 인덱스에 안 남는 경우가 없다
+- member가 couponId라서 발급이 아무리 많아도 ZSET 크기 = 최근 발급이 있었던 쿠폰 수
+
+#### 2) 대사 window 계산
+
+**Reconciler.kt**
+```kotlin
+@Scheduled(fixedRateString = "\${coupon.reconcile.interval-ms}")
+fun scheduleRecent() {
+    val cutoffMs = System.currentTimeMillis() - reconcileProperties.gracePeriodMs
+    val fromMs = cutoffMs - reconcileProperties.intervalMs * 2 //누락방지
+    val couponIds = reconcileRedisRepository.couponIdsIssuedBetween(fromMs, cutoffMs)
+    reconcileCoupons(couponIds)
+}
+```
+
+| 설정 | 기본값 | 의미 |
+|---|---|---|
+| `coupon.reconcile.interval-ms` | 60000 | 배치 주기 = window 한 칸 너비 |
+| `coupon.reconcile.grace-period-ms` | 10000 | 방금 발급돼 Consumer가 아직 DB에 못 쓴 쿠폰을 제외 (오탐 방지) |
+
+- **grace**: Redis 발급 → Kafka → DB 저장 사이의 지연 동안은 원래 수치가 안 맞는다. 이 구간을 대사하면 정상 상태를 불일치로 오판한다
+- **window = interval × 2**: 배치가 한 회차 밀리거나 실패해도 그 구간을 다음 회차가 다시 덮는다 (겹쳐서 보는 것은 보정이 멱등이라 안전)
+- 쿠폰 하나에서 예외가 나도 `try/catch`로 알람 처리 후 다음 쿠폰 계속 → 다음 회차에 재시도
+
+#### 3) 불일치 판정과 보정 범위
+
+**CouponReconciler.reconcile()** 판정식:
+
+```
+dbDrift   = total_quantity - (issued_quantity + Redis stock)
+userDrift = total_quantity - (Redis users 수  + Redis stock)
+```
+
+정상이라면 둘 다 0이다. (Redis에서 차감된 만큼 DB 발급 수와 Redis 명단이 늘어야 함)
+
+| 순서 | 상황 | 처리 | 이유 |
+|---|---|---|---|
+| 0 | 쿠폰 없음 / Redis stock 키 없음 | 알람 | 비교 기준 자체가 없음 |
+| 1 | `dbDrift ≠ 0` 또는 `stock < 0` | **알람만, 이후 보정 중단** | DB 저장 실패(→ DLT)인지 Redis 재고 오차감인지 대사만으로 구분 불가. 재고를 임의로 되돌리면 초과 발급 위험 |
+| 2 | `stock > 0`인데 매진 플래그 있음 | 플래그 삭제 (자동 보정) | 재고가 남았는데 매진 응답 → 발급 기회 손실 |
+| 2 | `stock = 0`인데 매진 플래그 없음 | 플래그 설정 (자동 보정) | 4단계 매진 차단이 동작하지 않음 |
+| 3 | `userDrift > 0` 이고 `(DB 발급자 − Redis 명단) 수 = userDrift` | 누락자 `SADD` (자동 보정) | DB 기준으로 누락자를 **정확히 특정** 가능, `SADD`는 멱등 |
+| 3 | `userDrift > 0`인데 누락자 수 ≠ drift | 알람 | 원인이 하나로 설명되지 않음 |
+| 3 | `userDrift < 0` | 알람 | Redis 명단이 DB보다 많음 → 중복 발급 차단 대상이 잘못 들어가 있을 수 있음 |
+
+```kotlin
+if (userDrift > 0) {
+    val redisUserIds = reconcileRedisRepository.userIds(couponId).mapNotNull { it.toLongOrNull() }
+    val missingUserIds = issuanceRepository.findUserIdsByCouponId(couponId) - redisUserIds
+    if (missingUserIds.size.toLong() == userDrift) {
+        reconcileRedisRepository.addUsers(couponId, missingUserIds)   // SADD
+        autoFixed++
+    } else {
+        driftAlert = true
+    }
+}
+```
+
+**핵심 포인트**:
+1. **보정은 "DB → Redis" 한 방향, 그리고 멱등한 연산만**: `SADD`, 매진 플래그 SET/DEL. 몇 번을 실행해도 결과가 같다
+2. **DB 측 불일치는 사람에게 넘긴다**: 자동으로 고칠 근거가 없는 불일치를 고치면 정합성 문제를 하나 더 만든다. 복구 경로는 DLT Replay
+3. **누락자 수 = drift 수일 때만 보정**: "누락 때문에 생긴 drift"라는 게 수치로 증명될 때만 손댄다
+
+### 코드 위치
+
+| 파일 | 역할 |
+|---|---|
+| `issue.lua` | 발급 시 `coupon:reconcile:recent` ZSET에 쿠폰 등록 |
+| `RedisKeys.kt` | `reconcileKey = "coupon:reconcile:recent"` |
+| `Reconciler.kt` | `@Scheduled` 최근 대사, `auditAll()` 전체 대사, 결과 집계 |
+| `CouponReconciler.kt` | 쿠폰 1건 판정 + 자동 보정 / 알람 |
+| `CouponReconcileRedisRepository.kt` | window 조회, stock/users 조회, `SADD`, 매진 플래그 SET/DEL |
+| `IssuanceRepository.kt` | `findUserIdsByCouponId()` — DB 발급자 목록 |
+| `ReconcileProperties.kt` | `interval-ms`, `grace-period-ms` 설정 |
+| `AdminReconcileController.kt` | `POST /admin/reconcile/run` 수동 전체 대사 |
 
 ---
 
@@ -314,6 +431,30 @@ fun replay(ids: List<Long>): Int {
 | **Kafka 재전송** (선택) | 기존 Consumer 재사용, 코드 중복 없음 | ✅ 선택: 일관된 처리 흐름 |
 | 직접 DB INSERT | Kafka 우회, 빠름 | Redis 재고/사용자 명단 동기화 누락 위험 |
 | 별도 Replay Worker | 일반 Consumer와 분리 | 코드 중복, 복잡도 증가 |
+
+### 4-4. 대사 실행 방식
+
+| 대안 | 장점 | 선택한/하지 않은 이유 |
+|---|---|---|
+| **주기 배치 `@Scheduled`** (선택) | 구현 단순, 발급 경로에 부하 없음 | ✅ 선택: 발급 hot path를 건드리지 않고 사후 검증 |
+| 발급마다 실시간 검증 | 불일치 즉시 감지 | 발급 경로에 DB 조회가 추가돼 3~4단계에서 줄인 응답 시간이 다시 늘어남 |
+| Spring Batch | 재시작·이력 관리 기능 | 쿠폰 단위 짧은 작업에 비해 메타 테이블·설정이 과함 |
+
+### 4-5. 대사 대상 선정
+
+| 대안 | 장점 | 선택한/하지 않은 이유 |
+|---|---|---|
+| **최근 발급 인덱스 (ZSET sliding window)** (선택) | 발급이 있었던 쿠폰만 점검, Lua에서 원자 기록 | ✅ 선택: 점검 비용이 전체 쿠폰 수가 아니라 최근 발급 쿠폰 수에 비례 |
+| 매 회차 전체 쿠폰 스캔 | 누락 없음, 구현 단순 | 쿠폰이 늘수록 매분 Redis·DB 조회가 비례 증가 → 수동 `auditAll()`로만 제공 |
+| DB `issued_at` 기준 조회 | Redis 추가 키 불필요 | Redis만 발급되고 DB 저장이 실패한 쿠폰(가장 잡고 싶은 케이스)이 빠짐 |
+
+### 4-6. 불일치 보정 범위
+
+| 대안 | 장점 | 선택한/하지 않은 이유 |
+|---|---|---|
+| **Redis 측만 자동 보정, DB 측은 알람** (선택) | 근거 있는 보정만 수행 | ✅ 선택: 누락자를 DB로 정확히 특정할 수 있는 경우에만 멱등 연산으로 보정 |
+| DB 측도 자동 보정 (Redis 재고를 DB에 맞춤) | 사람 개입 없음 | DLT에 대기 중인 발급이 있으면 재고를 되돌린 만큼 **초과 발급** 발생 |
+| 전부 알람만 | 가장 안전 | 원인이 명확한 Redis 명단 누락까지 사람이 처리 → 운영 부담, 그동안 중복 발급 차단 실패 |
 
 ---
 
