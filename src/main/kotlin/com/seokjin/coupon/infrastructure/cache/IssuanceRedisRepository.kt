@@ -1,5 +1,6 @@
 package com.seokjin.coupon.infrastructure.cache
 
+import com.seokjin.coupon.infrastructure.cache.RedisKeys
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.stereotype.Repository
 
@@ -18,9 +19,10 @@ class IssuanceRedisRepository(
             listOf(
                 RedisKeys.couponStock(couponId),
                 RedisKeys.couponUsers(couponId),
-                RedisKeys.couponSoldOut(couponId)
+                RedisKeys.couponSoldOut(couponId),
+                RedisKeys.reconcileKey
             ),
-            userId, soldOutProperties.ttlSeconds,
+            userId, soldOutProperties.ttlSeconds, System.currentTimeMillis(), couponId
         )
 
     fun initStock(couponId: Long, totalQuantity: Int) {
