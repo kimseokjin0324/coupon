@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../../.."
 BASE="${BASE_URL:-http://localhost:8080}"
 QUANTITY="${QUANTITY:-1000000}"
 
-[[ -f src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt ]] || {
+[[ -f src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt ]] || {
   echo "verify는 part-6-1-waiting-room 이후에 실행할 수 있다" >&2
   exit 1
 }

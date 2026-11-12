@@ -86,9 +86,9 @@ waiting_room() {
 }
 
 source_stage() {
-  if [[ -f gateway/src/main/kotlin/com/apiece/gateway/GatewayApplication.kt ]]; then
+  if [[ -f gateway/src/main/kotlin/com/seokjin/gateway/GatewayApplication.kt ]]; then
     printf 'gateway'
-  elif [[ -f src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt ]]; then
+  elif [[ -f src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt ]]; then
     printf 'single'
   else
     printf 'baseline'
@@ -99,19 +99,19 @@ MODE="${1:-$(source_stage)}"
 case "$MODE" in
   baseline) baseline ;;
   single|scale)
-    require_source src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
+    require_source src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
     waiting_room "$MODE"
     ;;
   verify)
-    require_source src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
+    require_source src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
     ./scripts/load/part-6/verify.sh
     ;;
   journey)
-    require_source src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
+    require_source src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt part-6-1-waiting-room
     ./scripts/load/part-6/waiting_room_journey.sh
     ;;
   gateway)
-    require_source gateway/src/main/kotlin/com/apiece/gateway/GatewayApplication.kt part-6-2-edge-rate-limit
+    require_source gateway/src/main/kotlin/com/seokjin/gateway/GatewayApplication.kt part-6-2-edge-rate-limit
     ./scripts/load/part-6/gateway_rate_limit.sh
     ;;
   *) echo "사용법: run.sh [baseline|single|scale|verify|journey|gateway]" >&2; exit 1 ;;

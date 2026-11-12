@@ -14,7 +14,7 @@ BURST_CAPACITY="${RATE_LIMIT_BURST:-10}"
 TOLERANCE_PERCENT="${TOLERANCE_PERCENT:-20}"
 QUANTITY="${QUANTITY:-1000000}"
 
-[[ -f gateway/src/main/kotlin/com/apiece/gateway/GatewayApplication.kt ]] || {
+[[ -f gateway/src/main/kotlin/com/seokjin/gateway/GatewayApplication.kt ]] || {
   echo "gateway_rate_limit은 part-6-2-edge-rate-limit에서 실행할 수 있다" >&2
   exit 1
 }

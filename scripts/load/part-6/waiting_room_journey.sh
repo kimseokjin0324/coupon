@@ -11,7 +11,7 @@ POLL_JITTER_SECONDS="${POLL_JITTER_SECONDS:-0.25}"
 MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-30}"
 QUANTITY="${QUANTITY:-1000000}"
 
-[[ -f src/main/kotlin/com/apiece/coupon/application/RedisWaitingRoom.kt ]] || {
+[[ -f src/main/kotlin/com/seokjin/coupon/application/RedisWaitingRoom.kt ]] || {
   echo "waiting_room_journey는 part-6-1-waiting-room 이후에 실행할 수 있다" >&2
   exit 1
 }
