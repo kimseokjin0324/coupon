@@ -135,7 +135,25 @@ RATE=5000 DURATION=30s ./scripts/load/part-6/run.sh baseline
 
 ### 5-2. part-6-1: 실제 사용자 여정 (`journey`)
 
-- TODO(측정 필요): `journey_status_polls`, `journey_polls_per_user`, `journey_waiting_time`, `journey_issued_users`
+**실행**: `./scripts/load/part-6/run.sh journey`
+**조건**: 사용자 200명이 동시에 1회씩 `POST 진입 → GET 상태 폴링(1s + 지터 0~0.25s) → 통과 후 POST 발급`. `admit-per-second=100`, 최대 대기 30s
+
+| 지표 | 값 |
+|---|---|
+| 발급 성공 (`journey_issued_users`) | **200 / 200** |
+| 실패 (`journey_failures`) | 0 |
+| 전체 HTTP 요청 | 675 (= 진입 200 + 폴링 275 + 발급 200) |
+| 폴링 요청 (`journey_status_polls`) | 275 |
+| 사용자당 폴링 횟수 avg / max | 1.375 / 2 |
+| 대기 시간 avg / med / P95 / max | 1.67s / 1.34s / 2.46s / 2.54s |
+| 폴링 응답 P95 / max (ms) | 11.25 / 25.08 |
+| 전체 HTTP P95 / max (ms) | 153.3 / 227.27 |
+| 전체 소요 | 2.5s |
+
+**관찰**:
+- 200명이 초당 100명씩 통과하므로 마지막 사용자는 약 2초 후 통과할 것으로 예상된다. 실측 max 대기 2.54s로 이와 맞다.
+- 폴링 때문에 늘어난 요청은 사용자 1명당 평균 1.375건이다. 발급 1건을 위해 클라이언트가 보내는 요청은 평균 3.375건(진입 1 + 폴링 1.375 + 발급 1)이다.
+- 폴링 P95는 11.25ms인데 전체 HTTP P95는 153.3ms다. 진입 또는 발급 쪽이 느린 것으로 보이지만, 태그별(`waiting_room_enter` / `coupon_issue`) 지연은 이번 출력에 없어서 확인하지 않았다. → TODO(측정 필요): `k6 run --summary-trend-stats` 또는 태그별 threshold로 분리
 
 ## 6. 트레이드오프 / 남은 한계
 
@@ -200,4 +218,13 @@ http://localhost:8080 준비 실패
 
 **해결**: 접두사를 `"waiting:{$couponId}:pass:"`로 변경. Kotlin `passKey()`와 `waiting-room-drain.lua`(`ARGV[3] .. userId`)가 같은 접두사를 쓰므로 한 곳만 고치면 양쪽이 맞춰진다.
 
-**교훈**: 앱 내부에서만 쓰는 키라도 외부 도구(측정 스크립트, 운영 SCAN)가 패턴으로 찾는다. 구분자 규칙(`:`)을 지켜야 `pass1`/`pass12` 같은 접두 매칭 혼동도 없다.
+**교훈(8-4)**: 앱 내부에서만 쓰는 키라도 외부 도구(측정 스크립트, 운영 SCAN)가 패턴으로 찾는다. 구분자 규칙(`:`)을 지켜야 `pass1`/`pass12` 같은 접두 매칭 혼동도 없다.
+
+### 8-5. 브랜치 전환 후 경로 수정이 사라짐
+
+**증상**: single/scale은 통과했는데, 이후 `journey`에서 "애플리케이션 준비 실패" 발생. `/api/users/me/issuances` → 404
+**원인**:
+- `part-6-1-waiting-room` 브랜치는 `8eda309`에서 갈라졌다. 경로 수정 커밋 `3a8b7d2`는 `part-6-0-load-test`에만 있었다.
+- 브랜치를 바꾼 뒤 재빌드하면서 컨트롤러가 다시 단수형(`/issuance`)으로 배포됐다.
+**해결**: `git cherry-pick 3a8b7d2` 후 재빌드
+**교훈**: 단계별 브랜치로 진행할 때는 다음 단계 브랜치를 만들기 전에 앞 브랜치의 수정을 merge해 둔다.
