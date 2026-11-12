@@ -78,8 +78,8 @@ RATE=5000 DURATION=30s ./scripts/load/part-6/run.sh baseline
 | 단계 | 구현 | 해결하는 문제 | 브랜치 |
 |---|---|---|---|
 | **part-6-0** | 대기실 없는 발급 부하 측정 | 문제 재현 (베이스라인) | `part-6-0-load-test` |
-| **part-6-1** | Redis 대기실 (전역 통과 속도) | TODO | `part-6-1-waiting-room` |
-| **part-6-2** | Gateway Rate Limit | TODO | `part-6-2-edge-rate-limit` |
+| **part-6-1** | Redis 대기실 (전역 통과 속도) | 발급 API 도착량을 서버 수와 무관하게 초당 N명으로 제한 | `part-6-1-waiting-room` |
+| **part-6-2** | Gateway Rate Limit | 한 사용자의 반복 요청(어뷰징)을 앱 앞단에서 429로 차단 | `part-6-2-edge-rate-limit` |
 
 ### 3-1. part-6-1: Redis 대기실
 
@@ -96,6 +96,21 @@ RATE=5000 DURATION=30s ./scripts/load/part-6/run.sh baseline
 | `WaitingRoomRedisRepository.kt` | 키 설계 (`waiting:{couponId}:queue`, `waiting:{couponId}:pass:<userId>`, `waiting:room`) |
 | `ShedLockConfig.kt` | Redis 기반 분산 락 (드레인 중복 실행 방지) |
 | `lua/waiting-room-*.lua` | 진입 / 상태 / 드레인 원자 연산 |
+
+### 3-2. part-6-2: Gateway Rate Limit
+
+- 별도 모듈 `gateway/` (Spring Cloud Gateway, WebFlux), 포트 `8090 → 8080`
+- 공개 사용자 API만 라우팅: `/api/waiting-room/**`, `/api/coupons/*/issue`, `/api/issuances/*/use`, `/api/users/me/issuances`. 관리자·메트릭 API는 라우팅하지 않는다.
+- `RequestRateLimiter` + `RedisRateLimiter` (Token Bucket), 키는 `userIdKeyResolver`(`user:<X-User-Id>`) → **사용자마다 별도 버킷**
+  - 헤더가 없거나 양의 정수가 아니면 `Mono.empty()` → Gateway 기본값(`deny-empty-key=true`)에 따라 거부 (응답 코드는 TODO(확인 필요))
+- 설정: `replenishRate=5`/s, `burstCapacity=10`, `requestedTokens=1` (`RATE_LIMIT_REPLENISH`, `RATE_LIMIT_BURST`로 오버라이드)
+- 한도 초과 시 Gateway가 **429**로 응답해 coupon-service까지 요청이 가지 않는다.
+
+| 파일 | 역할 |
+|---|---|
+| `gateway/src/main/kotlin/com/seokjin/gateway/GatewayApplication.kt` | Gateway 앱, `userIdKeyResolver` |
+| `gateway/src/main/resources/application.yml` | 라우트, Rate Limit 설정 |
+| `docker-compose.yml` (`gateway` 서비스) | Redis·coupon-service 연결, 한도 환경변수 |
 
 ## 4. 고려한 대안
 
@@ -154,6 +169,37 @@ RATE=5000 DURATION=30s ./scripts/load/part-6/run.sh baseline
 - 200명이 초당 100명씩 통과하므로 마지막 사용자는 약 2초 후 통과할 것으로 예상된다. 실측 max 대기 2.54s로 이와 맞다.
 - 폴링 때문에 늘어난 요청은 사용자 1명당 평균 1.375건이다. 발급 1건을 위해 클라이언트가 보내는 요청은 평균 3.375건(진입 1 + 폴링 1.375 + 발급 1)이다.
 - 폴링 P95는 11.25ms인데 전체 HTTP P95는 153.3ms다. 진입 또는 발급 쪽이 느린 것으로 보이지만, 태그별(`waiting_room_enter` / `coupon_issue`) 지연은 이번 출력에 없어서 확인하지 않았다. → TODO(측정 필요): `k6 run --summary-trend-stats` 또는 태그별 threshold로 분리
+
+### 5-3. part-6-2: Gateway Rate Limit (어뷰저 컷 + 정상 통과)
+
+**실행**: `./scripts/load/part-6/run.sh` (자동 판별 → `gateway`)
+**조건**: Gateway(`:8090`)로 10초간 동시 전송, `replenishRate=5`/s, `burstCapacity=10`
+- 어뷰저: 같은 userId 1개로 200 req/s
+- 정상: 매 요청 다른 userId로 20 req/s
+
+**어뷰저 통과 기대값**: `burst + replenish × 초 = 10 + 5 × 10 = 60`건 (허용 ±20%: 48~72)
+
+| 지표 | 어뷰저 (같은 id) | 정상 (매번 다른 id) |
+|---|---|---|
+| 전송 | 2,001 (200 req/s) | 201 (20 req/s) |
+| 통과 (`*_passed`) | **60** (기대값 60) | **201** |
+| 차단 429 (`*_blocked`) | **1,941** (97.0%) | **0** |
+| 그 외 실패 (`*_failed`) | 0 | 0 |
+| 실제 통과율 | 6.00/s | 20.09/s |
+
+| 지표 | 값 |
+|---|---|
+| 전체 요청 / dropped_iterations | 2,202 / 0 |
+| 전체 HTTP P95 / max (ms) | 6.69 / 39.02 |
+| 통과 응답(2xx) P50 / P95 / max (ms) | 5.89 / 15.14 / 39.02 |
+
+> `http_req_failed` 88.14%는 429 차단(1,941건)이 집계된 값이다. 서버 에러가 아니다.
+
+**관찰**:
+- 어뷰저 통과 60건이 Token Bucket 계산값(10 + 5 × 10)과 **정확히 일치**했다. 나머지 1,941건은 Gateway에서 429로 끊겨 coupon-service에 도착하지 않았다.
+- 정상 사용자는 각자 버킷이라 0건 차단. 한 사용자의 폭주가 다른 사용자의 통과에 영향을 주지 않았다.
+- 전체 P95가 6.69ms로, 통과 응답 P95 15.14ms보다 낮다. 429는 Gateway에서 바로 응답해서 빠르다. 통과 요청은 Gateway를 거쳐 coupon-service까지 다녀오기 때문에 이 차이가 생긴다.
+- Gateway를 거칠 때 추가되는 지연은 직접 호출과 비교하지 않아서 아직 모른다. → TODO(측정 필요)
 
 ## 6. 트레이드오프 / 남은 한계
 
